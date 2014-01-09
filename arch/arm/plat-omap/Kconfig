@@ -60,6 +60,13 @@ config OMAP_RESET_CLOCKS
 	  probably do not want this option enabled until your
 	  device drivers work properly.
 
+config OMAP_GPIO_SWITCH
+	bool "GPIO switch support"
+	default n
+	help
+	  Say Y, if you want to have support for reporting of GPIO
+	  switches (e.g. cover switches) via sysfs.
+
 config OMAP_MUX
 	bool "OMAP multiplexing support"
 	depends on ARCH_OMAP
@@ -88,7 +95,7 @@ config OMAP_MUX_WARNINGS
 
 config OMAP_MBOX_FWK
 	tristate "Mailbox framework support"
-	depends on ARCH_OMAP && !ARCH_MULTIPLATFORM
+	depends on ARCH_OMAP
 	help
 	  Say Y here if you want to use OMAP Mailbox framework support for
 	  DSP, IVA1.0 and IVA2 in OMAP1/2/3.

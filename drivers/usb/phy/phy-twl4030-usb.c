@@ -621,6 +621,13 @@ static int twl4030_set_suspend(struct usb_phy *x, int suspend)
 	return 0;
 }
 
+static int twl4030_set_power(struct usb_phy *x, unsigned mA)
+{
+	atomic_notifier_call_chain(&x->notifier,
+			USB_EVENT_ENUMERATED, &mA);
+	return 0;
+}
+
 static int twl4030_set_peripheral(struct usb_otg *otg,
 					struct usb_gadget *gadget)
 {
@@ -684,6 +691,7 @@ static int twl4030_usb_probe(struct platform_device *pdev)
 	twl->phy.type		= USB_PHY_TYPE_USB2;
 	twl->phy.set_suspend	= twl4030_set_suspend;
 	twl->phy.init		= twl4030_usb_phy_init;
+	twl->phy.set_power	= twl4030_set_power;
 
 	otg->phy		= &twl->phy;
 	otg->set_host		= twl4030_set_host;
@@ -704,6 +712,8 @@ static int twl4030_usb_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, twl);
 	if (device_create_file(&pdev->dev, &dev_attr_vbus))
 		dev_warn(&pdev->dev, "could not create sysfs file\n");
+
+	ATOMIC_INIT_NOTIFIER_HEAD(&twl->phy.notifier);
 
 	/* Our job is to use irqs and status from the power module
 	 * to keep the transceiver disabled when nothing's connected.

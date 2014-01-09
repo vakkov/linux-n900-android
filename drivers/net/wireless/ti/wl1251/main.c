@@ -27,7 +27,9 @@
 #include <linux/crc32.h>
 #include <linux/etherdevice.h>
 #include <linux/vmalloc.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/netdevice.h>
 
 #include "wl1251.h"
 #include "wl12xx_80211.h"
@@ -41,6 +43,7 @@
 #include "init.h"
 #include "debugfs.h"
 #include "boot.h"
+#include "netlink.h"
 
 void wl1251_enable_interrupts(struct wl1251 *wl)
 {
@@ -479,10 +482,13 @@ static void wl1251_op_stop(struct ieee80211_hw *hw)
 	wl->next_tx_complete = 0;
 	wl->elp = false;
 	wl->station_mode = STATION_ACTIVE_MODE;
+	wl->psm_entry_retry = 0;
 	wl->tx_queue_stopped = false;
 	wl->power_level = WL1251_DEFAULT_POWER_LEVEL;
 	wl->rssi_thold = 0;
 	wl->channel = WL1251_DEFAULT_CHANNEL;
+	wl->monitor_present = false;
+	wl->joined = false;
 
 	wl1251_debugfs_reset(wl);
 
@@ -542,6 +548,7 @@ static void wl1251_op_remove_interface(struct ieee80211_hw *hw,
 	mutex_lock(&wl->mutex);
 	wl1251_debug(DEBUG_MAC80211, "mac80211 remove interface");
 	wl->vif = NULL;
+	memset(wl->bssid, 0, ETH_ALEN);
 	mutex_unlock(&wl->mutex);
 }
 
@@ -575,8 +582,10 @@ static int wl1251_op_config(struct ieee80211_hw *hw, u32 changed)
 	channel = ieee80211_frequency_to_channel(
 			conf->chandef.chan->center_freq);
 
-	wl1251_debug(DEBUG_MAC80211, "mac80211 config ch %d psm %s power %d",
+	wl1251_debug(DEBUG_MAC80211,
+		     "mac80211 config ch %d monitor %s psm %s power %d",
 		     channel,
+		     conf->flags & IEEE80211_CONF_MONITOR ? "on" : "off",
 		     conf->flags & IEEE80211_CONF_PS ? "on" : "off",
 		     conf->power_level);
 
@@ -586,16 +595,45 @@ static int wl1251_op_config(struct ieee80211_hw *hw, u32 changed)
 	if (ret < 0)
 		goto out;
 
-	if (channel != wl->channel) {
-		wl->channel = channel;
+	if (changed & IEEE80211_CONF_CHANGE_MONITOR) {
+		u32 mode;
 
-		ret = wl1251_join(wl, wl->bss_type, wl->channel,
-				  wl->beacon_int, wl->dtim_period);
+		if (conf->flags & IEEE80211_CONF_MONITOR) {
+			wl->monitor_present = true;
+			mode = DF_SNIFF_MODE_ENABLE | DF_ENCRYPTION_DISABLE;
+		} else {
+			wl->monitor_present = false;
+			mode = 0;
+		}
+
+		ret = wl1251_acx_feature_cfg(wl, mode);
 		if (ret < 0)
 			goto out_sleep;
 	}
 
-	if (conf->flags & IEEE80211_CONF_PS && !wl->psm_requested) {
+	if (channel != wl->channel) {
+		wl->channel = channel;
+
+		/*
+		 * Use ENABLE_RX command for channel switching when no
+		 * interface is present (monitor mode only).
+		 * This leaves the tx path disabled in firmware, whereas
+		 * the usual JOIN command seems to transmit some frames
+		 * at firmware level.
+		 */
+		if (wl->vif == NULL) {
+			wl->joined = false;
+			ret = wl1251_cmd_data_path_rx(wl, wl->channel, 1);
+		} else {
+			ret = wl1251_join(wl, wl->bss_type, wl->channel,
+					  wl->beacon_int, wl->dtim_period);
+		}
+		if (ret < 0)
+			goto out_sleep;
+	}
+
+	if (conf->flags & IEEE80211_CONF_PS && !wl->psm_requested &&
+	    !wl->monitor_present) {
 		wl1251_debug(DEBUG_PSM, "psm enabled");
 
 		wl->psm_requested = true;
@@ -611,8 +649,8 @@ static int wl1251_op_config(struct ieee80211_hw *hw, u32 changed)
 		ret = wl1251_ps_set_mode(wl, STATION_POWER_SAVE_MODE);
 		if (ret < 0)
 			goto out_sleep;
-	} else if (!(conf->flags & IEEE80211_CONF_PS) &&
-		   wl->psm_requested) {
+	} else if ((!(conf->flags & IEEE80211_CONF_PS) || wl->monitor_present)
+		   && wl->psm_requested) {
 		wl1251_debug(DEBUG_PSM, "psm disabled");
 
 		wl->psm_requested = false;
@@ -648,6 +686,16 @@ static int wl1251_op_config(struct ieee80211_hw *hw, u32 changed)
 		wl->power_level = conf->power_level;
 	}
 
+	/*
+	 * Tell stack that connection is lost because hw encryption isn't
+	 * supported in monitor mode.
+	 * XXX This requires temporary enabling the hw connection monitor flag
+	 */
+	if ((changed & IEEE80211_CONF_CHANGE_MONITOR) && wl->vif) {
+		wl->hw->flags |= IEEE80211_HW_CONNECTION_MONITOR;
+		ieee80211_connection_loss(wl->vif);
+	}
+
 out_sleep:
 	wl1251_ps_elp_sleep(wl);
 
@@ -655,6 +703,44 @@ out:
 	mutex_unlock(&wl->mutex);
 
 	return ret;
+}
+
+struct wl1251_filter_params {
+	bool enabled;
+	int mc_list_length;
+	u8 mc_list[ACX_MC_ADDRESS_GROUP_MAX][ETH_ALEN];
+};
+
+static u64 wl1251_op_prepare_multicast(struct ieee80211_hw *hw,
+				       struct netdev_hw_addr_list *mc_list)
+{
+	struct wl1251_filter_params *fp;
+	struct netdev_hw_addr *ha;
+	struct wl1251 *wl = hw->priv;
+
+	if (unlikely(wl->state == WL1251_STATE_OFF))
+		return 0;
+
+	fp = kzalloc(sizeof(*fp), GFP_ATOMIC);
+	if (!fp) {
+		wl1251_error("Out of memory setting filters.");
+		return 0;
+	}
+
+	/* update multicast filtering parameters */
+	fp->mc_list_length = 0;
+	if (netdev_hw_addr_list_count(mc_list) > ACX_MC_ADDRESS_GROUP_MAX) {
+		fp->enabled = false;
+	} else {
+		fp->enabled = true;
+		netdev_hw_addr_list_for_each(ha, mc_list) {
+			memcpy(fp->mc_list[fp->mc_list_length],
+					ha->addr, ETH_ALEN);
+			fp->mc_list_length++;
+		}
+	}
+
+	return (u64)(unsigned long)fp;
 }
 
 #define WL1251_SUPPORTED_FILTERS (FIF_PROMISC_IN_BSS | \
@@ -667,8 +753,9 @@ out:
 
 static void wl1251_op_configure_filter(struct ieee80211_hw *hw,
 				       unsigned int changed,
-				       unsigned int *total,u64 multicast)
+				       unsigned int *total, u64 multicast)
 {
+	struct wl1251_filter_params *fp = (void *)(unsigned long)multicast;
 	struct wl1251 *wl = hw->priv;
 	int ret;
 
@@ -677,9 +764,11 @@ static void wl1251_op_configure_filter(struct ieee80211_hw *hw,
 	*total &= WL1251_SUPPORTED_FILTERS;
 	changed &= WL1251_SUPPORTED_FILTERS;
 
-	if (changed == 0)
+	if (changed == 0) {
 		/* no filters which we support changed */
+		kfree(fp);
 		return;
+	}
 
 	mutex_lock(&wl->mutex);
 
@@ -716,6 +805,15 @@ static void wl1251_op_configure_filter(struct ieee80211_hw *hw,
 	if (ret < 0)
 		goto out;
 
+	if (*total & FIF_ALLMULTI || *total & FIF_PROMISC_IN_BSS)
+		ret = wl1251_acx_group_address_tbl(wl, false, NULL, 0);
+	else if (fp)
+		ret = wl1251_acx_group_address_tbl(wl, fp->enabled,
+						   fp->mc_list,
+						   fp->mc_list_length);
+	if (ret < 0)
+		goto out;
+
 	/* send filters to firmware */
 	wl1251_acx_rx_config(wl, wl->rx_config, wl->rx_filter);
 
@@ -723,6 +821,7 @@ static void wl1251_op_configure_filter(struct ieee80211_hw *hw,
 
 out:
 	mutex_unlock(&wl->mutex);
+	kfree(fp);
 }
 
 /* HW encryption */
@@ -802,12 +901,12 @@ static int wl1251_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 
 	mutex_lock(&wl->mutex);
 
-	ret = wl1251_ps_elp_wakeup(wl);
-	if (ret < 0)
-		goto out_unlock;
-
 	switch (cmd) {
 	case SET_KEY:
+		if (wl->monitor_present) {
+			ret = -EOPNOTSUPP;
+			goto out_unlock;
+		}
 		wl_cmd->key_action = KEY_ADD_OR_REPLACE;
 		break;
 	case DISABLE_KEY:
@@ -817,6 +916,10 @@ static int wl1251_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		wl1251_error("Unsupported key cmd 0x%x", cmd);
 		break;
 	}
+
+	ret = wl1251_ps_elp_wakeup(wl);
+	if (ret < 0)
+		goto out_unlock;
 
 	ret = wl1251_set_key_type(wl, wl_cmd, cmd, key, addr);
 	if (ret < 0) {
@@ -930,6 +1033,7 @@ static int wl1251_op_hw_scan(struct ieee80211_hw *hw,
 	ret = wl1251_cmd_scan(wl, ssid, ssid_len, req->channels,
 			      req->n_channels, WL1251_SCAN_NUM_PROBES);
 	if (ret < 0) {
+		wl1251_debug(DEBUG_SCAN, "scan failed %d", ret);
 		wl->scanning = false;
 		goto out_idle;
 	}
@@ -1023,6 +1127,9 @@ static void wl1251_op_bss_info_changed(struct ieee80211_hw *hw,
 	}
 
 	if (changed & BSS_CHANGED_ASSOC) {
+		/* XXX Disable temporary enabled hw connection monitor flag */
+		wl->hw->flags &= ~IEEE80211_HW_CONNECTION_MONITOR;
+
 		if (bss_conf->assoc) {
 			wl->beacon_int = bss_conf->beacon_int;
 
@@ -1073,6 +1180,19 @@ static void wl1251_op_bss_info_changed(struct ieee80211_hw *hw,
 			wl1251_warning("Set ctsprotect failed %d", ret);
 			goto out_sleep;
 		}
+	}
+
+	if (changed & BSS_CHANGED_ARP_FILTER) {
+		__be32 addr = bss_conf->arp_addr_list[0];
+		WARN_ON(wl->bss_type != BSS_TYPE_STA_BSS);
+
+		if (bss_conf->arp_addr_cnt == 1 && bss_conf->assoc)
+			ret = wl1251_acx_arp_ip_filter(wl, true, addr);
+		else
+			ret = wl1251_acx_arp_ip_filter(wl, false, addr);
+
+		if (ret < 0)
+			goto out_sleep;
 	}
 
 	if (changed & BSS_CHANGED_BEACON) {
@@ -1245,6 +1365,7 @@ static const struct ieee80211_ops wl1251_ops = {
 	.add_interface = wl1251_op_add_interface,
 	.remove_interface = wl1251_op_remove_interface,
 	.config = wl1251_op_config,
+	.prepare_multicast = wl1251_op_prepare_multicast,
 	.configure_filter = wl1251_op_configure_filter,
 	.tx = wl1251_op_tx,
 	.set_key = wl1251_op_set_key,
@@ -1253,6 +1374,283 @@ static const struct ieee80211_ops wl1251_ops = {
 	.set_rts_threshold = wl1251_op_set_rts_threshold,
 	.conf_tx = wl1251_op_conf_tx,
 	.get_survey = wl1251_op_get_survey,
+};
+
+static ssize_t wl1251_sysfs_show_address(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct wl1251 *wl = dev_get_drvdata(dev);
+	ssize_t len;
+
+	/* FIXME: what's the maximum length of buf? page size?*/
+	len = 500;
+
+	len = snprintf(buf, len, "%.2x:%.2x:%.2x:%.2x:%.2x:%.2x\n",
+		       wl->mac_addr[0], wl->mac_addr[1], wl->mac_addr[2],
+		       wl->mac_addr[3], wl->mac_addr[4], wl->mac_addr[5]);
+
+	return len;
+}
+
+static ssize_t wl1251_sysfs_store_address(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct wl1251 *wl = dev_get_drvdata(dev);
+	unsigned int addr[6];
+	int ret, i;
+
+	ret = sscanf(buf, "%2x:%2x:%2x:%2x:%2x:%2x\n",
+			&addr[0], &addr[1], &addr[2],
+			&addr[3], &addr[4], &addr[5]);
+
+	if (ret != 6)
+		return -EINVAL;
+
+	for (i = 0; i < 6; i++)
+		wl->mac_addr[i] = addr[i] & 0xff;
+
+	SET_IEEE80211_PERM_ADDR(wl->hw, wl->mac_addr);
+
+	return count;
+}
+
+static ssize_t wl1251_sysfs_show_tx_mgmt_frm_rate(struct device *dev,
+						  struct device_attribute *attr,
+						  char *buf)
+{
+	struct wl1251 *wl = dev_get_drvdata(dev);
+	ssize_t len;
+	int val;
+
+	/* FIXME: what's the maximum length of buf? page size?*/
+	len = 500;
+
+	switch (wl->tx_mgmt_frm_rate) {
+		/* skip 1 and 12 Mbps because they have same value 0x0a */
+	case RATE_2MBPS:
+		val = 20;
+		break;
+	case RATE_5_5MBPS:
+		val = 55;
+		break;
+	case RATE_11MBPS:
+		val = 110;
+		break;
+	case RATE_6MBPS:
+		val = 60;
+		break;
+	case RATE_9MBPS:
+		val = 90;
+		break;
+	case RATE_12MBPS:
+		val = 120;
+		break;
+	case RATE_18MBPS:
+		val = 180;
+		break;
+	case RATE_24MBPS:
+		val = 240;
+		break;
+	case RATE_36MBPS:
+		val = 360;
+		break;
+	case RATE_48MBPS:
+		val = 480;
+		break;
+	case RATE_54MBPS:
+		val = 540;
+		break;
+	default:
+		val = 10;
+	}
+
+	/* for 1 and 12 Mbps we have to check the modulation */
+	if (wl->tx_mgmt_frm_rate == RATE_1MBPS) {
+		switch (wl->tx_mgmt_frm_rate) {
+		case CCK_LONG:
+			val = 10;
+			break;
+		case OFDM:
+			val = 120;
+			break;
+		default:
+			val = 10;
+			break;
+		}
+	}
+	len = snprintf(buf, len, "%d", val);
+
+	return len;
+}
+
+static ssize_t wl1251_sysfs_store_tx_mgmt_frm_rate(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct wl1251 *wl = dev_get_drvdata(dev);
+	unsigned long res;
+	int ret;
+
+	ret = strict_strtoul(buf, 10, &res);
+
+	if (ret < 0) {
+		wl1251_warning("incorrect value written to tx_mgmt_frm_rate");
+		return 0;
+	}
+
+	switch (res) {
+	case 10:
+		wl->tx_mgmt_frm_rate = RATE_1MBPS;
+		wl->tx_mgmt_frm_mod = CCK_LONG;
+		break;
+	case 20:
+		wl->tx_mgmt_frm_rate = RATE_2MBPS;
+		wl->tx_mgmt_frm_mod = CCK_LONG;
+		break;
+	case 55:
+		wl->tx_mgmt_frm_rate = RATE_5_5MBPS;
+		wl->tx_mgmt_frm_mod = CCK_LONG;
+		break;
+	case 110:
+		wl->tx_mgmt_frm_rate = RATE_11MBPS;
+		wl->tx_mgmt_frm_mod = CCK_LONG;
+		break;
+	case 60:
+		wl->tx_mgmt_frm_rate = RATE_6MBPS;
+		wl->tx_mgmt_frm_mod = OFDM;
+		break;
+	case 90:
+		wl->tx_mgmt_frm_rate = RATE_9MBPS;
+		wl->tx_mgmt_frm_mod = OFDM;
+		break;
+	case 120:
+		wl->tx_mgmt_frm_rate = RATE_12MBPS;
+		wl->tx_mgmt_frm_mod = OFDM;
+		break;
+	case 180:
+		wl->tx_mgmt_frm_rate = RATE_18MBPS;
+		wl->tx_mgmt_frm_mod = OFDM;
+		break;
+	case 240:
+		wl->tx_mgmt_frm_rate = RATE_24MBPS;
+		wl->tx_mgmt_frm_mod = OFDM;
+		break;
+	case 360:
+		wl->tx_mgmt_frm_rate = RATE_36MBPS;
+		wl->tx_mgmt_frm_mod = OFDM;
+		break;
+	case 480:
+		wl->tx_mgmt_frm_rate = RATE_48MBPS;
+		wl->tx_mgmt_frm_mod = OFDM;
+		break;
+	case 540:
+		wl->tx_mgmt_frm_rate = RATE_54MBPS;
+		wl->tx_mgmt_frm_mod = OFDM;
+		break;
+	default:
+		wl1251_warning("incorrect value written to tx_mgmt_frm_rate");
+		return 0;
+	}
+
+	return count;
+}
+
+static ssize_t wl1251_sysfs_show_bt_coex_mode(struct device *dev,
+					      struct device_attribute *attr,
+					      char *buf)
+{
+	struct wl1251 *wl = dev_get_drvdata(dev);
+	ssize_t len;
+
+	/* FIXME: what's the maximum length of buf? page size?*/
+	len = 500;
+
+	mutex_lock(&wl->mutex);
+	len = snprintf(buf, len, "%d\n\n%d - off\n%d - on\n%d - monoaudio\n",
+		       wl->bt_coex_mode,
+		       WL1251_BT_COEX_OFF,
+		       WL1251_BT_COEX_ENABLE,
+		       WL1251_BT_COEX_MONOAUDIO);
+	mutex_unlock(&wl->mutex);
+
+	return len;
+
+}
+
+static ssize_t wl1251_sysfs_store_bt_coex_mode(struct device *dev,
+					       struct device_attribute *attr,
+					       const char *buf, size_t count)
+{
+	struct wl1251 *wl = dev_get_drvdata(dev);
+	unsigned long res;
+	int ret;
+
+	ret = strict_strtoul(buf, 10, &res);
+
+	if (ret < 0) {
+		wl1251_warning("incorrect value written to bt_coex_mode");
+		return count;
+	}
+
+	mutex_lock(&wl->mutex);
+
+	if (res == wl->bt_coex_mode)
+		goto out;
+
+	switch (res) {
+	case WL1251_BT_COEX_OFF:
+	case WL1251_BT_COEX_ENABLE:
+	case WL1251_BT_COEX_MONOAUDIO:
+		wl->bt_coex_mode = res;
+		break;
+	default:
+		wl1251_warning("incorrect value written to bt_coex_mode");
+		goto out;
+	}
+
+	if (wl->state == WL1251_STATE_OFF)
+		goto out;
+
+	ret = wl1251_ps_elp_wakeup(wl);
+	if (ret < 0)
+		goto out;
+
+	wl1251_acx_sg_configure(wl, false);
+	wl1251_ps_elp_sleep(wl);
+
+out:
+	mutex_unlock(&wl->mutex);
+	return count;
+}
+
+static DEVICE_ATTR(address, S_IRUGO | S_IWUSR,
+		   wl1251_sysfs_show_address,
+		   wl1251_sysfs_store_address);
+
+static DEVICE_ATTR(tx_mgmt_frm_rate, S_IRUGO | S_IWUSR,
+		   wl1251_sysfs_show_tx_mgmt_frm_rate,
+		   wl1251_sysfs_store_tx_mgmt_frm_rate);
+
+static DEVICE_ATTR(bt_coex_mode, S_IRUGO | S_IWUSR,
+		   wl1251_sysfs_show_bt_coex_mode,
+		   wl1251_sysfs_store_bt_coex_mode);
+
+static void wl1251_device_release(struct device *dev)
+{
+
+}
+
+static struct platform_device wl1251_device = {
+	/* FIXME: use wl12xx name to not break the user space */
+	.name		= "wl12xx",
+	.id		= -1,
+
+	/* device model insists to have a release function */
+	.dev            = {
+		.release = wl1251_device_release,
+	},
 };
 
 static int wl1251_read_eeprom_byte(struct wl1251 *wl, off_t offset, u8 *data)
@@ -1354,7 +1752,8 @@ int wl1251_init_ieee80211(struct wl1251 *wl)
 		IEEE80211_HW_SUPPORTS_UAPSD;
 
 	wl->hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
-					 BIT(NL80211_IFTYPE_ADHOC);
+					 BIT(NL80211_IFTYPE_ADHOC) |
+					 BIT(NL80211_IFTYPE_MONITOR);
 	wl->hw->wiphy->max_scan_ssids = 1;
 	wl->hw->wiphy->bands[IEEE80211_BAND_2GHZ] = &wl1251_band_2ghz;
 
@@ -1366,6 +1765,41 @@ int wl1251_init_ieee80211(struct wl1251 *wl)
 	ret = wl1251_register_hw(wl);
 	if (ret)
 		goto out;
+
+	ret = wl1251_nl_register();
+	if (ret)
+		goto out;
+
+	/* Register platform device */
+	ret = platform_device_register(&wl1251_device);
+	if (ret) {
+		wl1251_error("couldn't register platform device");
+		goto out;
+	}
+	dev_set_drvdata(&wl1251_device.dev, wl);
+
+	/* Create sysfs file address */
+	ret = device_create_file(&wl1251_device.dev,
+				 &dev_attr_address);
+	if (ret < 0) {
+		wl1251_error("failed to create sysfs file address");
+		goto out;
+	}
+
+	/* Create sysfs file tx_mgmt_frm_rate */
+	ret = device_create_file(&wl1251_device.dev,
+				 &dev_attr_tx_mgmt_frm_rate);
+	if (ret < 0) {
+		wl1251_error("failed to create sysfs file tx_mgmt_frm_rate");
+		goto out;
+	}
+
+	/* Create sysfs file to control bt coex state */
+	ret = device_create_file(&wl1251_device.dev, &dev_attr_bt_coex_mode);
+	if (ret < 0) {
+		wl1251_error("failed to create sysfs file bt_coex_mode");
+		goto out;
+	}
 
 	wl1251_debugfs_init(wl);
 	wl1251_notice("initialized");
@@ -1401,7 +1835,10 @@ struct ieee80211_hw *wl1251_alloc_hw(void)
 
 	INIT_DELAYED_WORK(&wl->elp_work, wl1251_elp_work);
 	wl->channel = WL1251_DEFAULT_CHANNEL;
+	wl->monitor_present = false;
+	wl->joined = false;
 	wl->scanning = false;
+	wl->bss_type = MAX_BSS_TYPE;
 	wl->default_key = 0;
 	wl->listen_int = 1;
 	wl->rx_counter = 0;
@@ -1413,12 +1850,14 @@ struct ieee80211_hw *wl1251_alloc_hw(void)
 	wl->elp = false;
 	wl->station_mode = STATION_ACTIVE_MODE;
 	wl->psm_requested = false;
+	wl->psm_entry_retry = 0;
 	wl->tx_queue_stopped = false;
 	wl->power_level = WL1251_DEFAULT_POWER_LEVEL;
 	wl->rssi_thold = 0;
 	wl->beacon_int = WL1251_DEFAULT_BEACON_INT;
 	wl->dtim_period = WL1251_DEFAULT_DTIM_PERIOD;
 	wl->vif = NULL;
+	wl->bt_coex_mode = WL1251_BT_COEX_OFF;
 
 	for (i = 0; i < FW_TX_CMPLT_BLOCK_SIZE; i++)
 		wl->tx_frames[i] = NULL;
@@ -1454,9 +1893,13 @@ EXPORT_SYMBOL_GPL(wl1251_alloc_hw);
 
 int wl1251_free_hw(struct wl1251 *wl)
 {
+	wl1251_nl_unregister();
+
 	ieee80211_unregister_hw(wl->hw);
 
 	wl1251_debugfs_exit(wl);
+
+	platform_device_unregister(&wl1251_device);
 
 	kfree(wl->target_mem_map);
 	kfree(wl->data_path);
@@ -1478,3 +1921,4 @@ MODULE_DESCRIPTION("TI wl1251 Wireles LAN Driver Core");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kalle Valo <kvalo@adurom.com>");
 MODULE_FIRMWARE(WL1251_FW_NAME);
+MODULE_FIRMWARE(WL1251_NVS_NAME);

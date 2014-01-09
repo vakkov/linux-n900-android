@@ -209,7 +209,7 @@ out:
 	return ret;
 }
 
-int wl1251_acx_feature_cfg(struct wl1251 *wl)
+int wl1251_acx_feature_cfg(struct wl1251 *wl, u32 data_flow_options)
 {
 	struct acx_feature_config *feature;
 	int ret;
@@ -222,8 +222,8 @@ int wl1251_acx_feature_cfg(struct wl1251 *wl)
 		goto out;
 	}
 
-	/* DF_ENCRYPTION_DISABLE and DF_SNIFF_MODE_ENABLE are disabled */
-	feature->data_flow_options = 0;
+	/* DF_ENCRYPTION_DISABLE and DF_SNIFF_MODE_ENABLE can be set */
+	feature->data_flow_options = data_flow_options;
 	feature->options = 0;
 
 	ret = wl1251_cmd_configure(wl, ACX_FEATURE_CFG,
@@ -408,7 +408,8 @@ out:
 	return ret;
 }
 
-int wl1251_acx_group_address_tbl(struct wl1251 *wl)
+int wl1251_acx_group_address_tbl(struct wl1251 *wl, bool enable,
+				 void *mc_list, u32 mc_list_len)
 {
 	struct acx_dot11_grp_addr_tbl *acx;
 	int ret;
@@ -422,9 +423,9 @@ int wl1251_acx_group_address_tbl(struct wl1251 *wl)
 	}
 
 	/* MAC filtering */
-	acx->enabled = 0;
-	acx->num_groups = 0;
-	memset(acx->mac_table, 0, ADDRESS_GROUP_MAX_LEN);
+	acx->enabled = enable;
+	acx->num_groups = mc_list_len;
+	memcpy(acx->mac_table, mc_list, mc_list_len * ETH_ALEN);
 
 	ret = wl1251_cmd_configure(wl, DOT11_GROUP_ADDRESS_TBL,
 				   acx, sizeof(*acx));
@@ -581,7 +582,7 @@ out:
 	return ret;
 }
 
-int wl1251_acx_sg_enable(struct wl1251 *wl)
+int wl1251_acx_sg_enable(struct wl1251 *wl, u8 mode)
 {
 	struct acx_bt_wlan_coex *pta;
 	int ret;
@@ -594,7 +595,7 @@ int wl1251_acx_sg_enable(struct wl1251 *wl)
 		goto out;
 	}
 
-	pta->enable = SG_ENABLE;
+	pta->enable = mode;
 
 	ret = wl1251_cmd_configure(wl, ACX_SG_ENABLE, pta, sizeof(*pta));
 	if (ret < 0) {
@@ -607,7 +608,7 @@ out:
 	return ret;
 }
 
-int wl1251_acx_sg_cfg(struct wl1251 *wl)
+int wl1251_acx_sg_cfg(struct wl1251 *wl, u16 wake_up_beacon)
 {
 	struct acx_bt_wlan_coex_param *param;
 	int ret;
@@ -632,7 +633,7 @@ int wl1251_acx_sg_cfg(struct wl1251 *wl)
 	param->wlan_cycle_fast = PTA_CYCLE_TIME_FAST_DEF;
 	param->bt_anti_starvation_period = PTA_ANTI_STARVE_PERIOD_DEF;
 	param->next_bt_lp_packet = PTA_TIMEOUT_NEXT_BT_LP_PACKET_DEF;
-	param->wake_up_beacon = PTA_TIME_BEFORE_BEACON_DEF;
+	param->wake_up_beacon = wake_up_beacon;
 	param->hp_dm_max_guard_time = PTA_HPDM_MAX_TIME_DEF;
 	param->next_wlan_packet = PTA_TIME_OUT_NEXT_WLAN_DEF;
 	param->antenna_type = PTA_ANTENNA_TYPE_DEF;
@@ -658,6 +659,41 @@ int wl1251_acx_sg_cfg(struct wl1251 *wl)
 
 out:
 	kfree(param);
+	return ret;
+}
+
+int wl1251_acx_sg_configure(struct wl1251 *wl, bool force)
+{
+	int ret;
+
+	if (wl->state == WL1251_STATE_OFF && !force)
+		return 0;
+
+	switch (wl->bt_coex_mode) {
+	case WL1251_BT_COEX_OFF:
+		ret = wl1251_acx_sg_enable(wl, SG_DISABLE);
+		if (ret)
+			break;
+		ret = wl1251_acx_sg_cfg(wl, 0);
+		break;
+	case WL1251_BT_COEX_ENABLE:
+		ret = wl1251_acx_sg_enable(wl, SG_ENABLE);
+		if (ret)
+			break;
+		ret = wl1251_acx_sg_cfg(wl, PTA_TIME_BEFORE_BEACON_DEF);
+		break;
+	case WL1251_BT_COEX_MONOAUDIO:
+		ret = wl1251_acx_sg_enable(wl, SG_ENABLE);
+		if (ret)
+			break;
+		ret = wl1251_acx_sg_cfg(wl, PTA_TIME_BEFORE_BEACON_MONO_AUDIO);
+		break;
+	default:
+		wl1251_error("Invalid BT co-ex mode!");
+		ret = -EOPNOTSUPP;
+		break;
+	}
+
 	return ret;
 }
 
@@ -907,11 +943,17 @@ int wl1251_acx_rate_policies(struct wl1251 *wl)
 	}
 
 	/* configure one default (one-size-fits-all) rate class */
-	acx->rate_class_cnt = 1;
+	acx->rate_class_cnt = 2;
 	acx->rate_class[0].enabled_rates = ACX_RATE_MASK_UNSPECIFIED;
 	acx->rate_class[0].short_retry_limit = ACX_RATE_RETRY_LIMIT;
 	acx->rate_class[0].long_retry_limit = ACX_RATE_RETRY_LIMIT;
 	acx->rate_class[0].aflags = 0;
+
+	/* no-retry rate class */
+	acx->rate_class[1].enabled_rates = ACX_RATE_MASK_UNSPECIFIED;
+	acx->rate_class[1].short_retry_limit = 0;
+	acx->rate_class[1].long_retry_limit = 0;
+	acx->rate_class[1].aflags = 0;
 
 	ret = wl1251_cmd_configure(wl, ACX_RATE_POLICY, acx, sizeof(*acx));
 	if (ret < 0) {
@@ -1019,6 +1061,37 @@ int wl1251_acx_bet_enable(struct wl1251 *wl, enum wl1251_acx_bet_mode mode,
 	ret = wl1251_cmd_configure(wl, ACX_BET_ENABLE, acx, sizeof(*acx));
 	if (ret < 0) {
 		wl1251_warning("wl1251 acx bet enable failed: %d", ret);
+		goto out;
+	}
+
+out:
+	kfree(acx);
+	return ret;
+}
+
+int wl1251_acx_arp_ip_filter(struct wl1251 *wl, bool enable, __be32 address)
+{
+	struct wl1251_acx_arp_filter *acx;
+	int ret;
+
+	wl1251_debug(DEBUG_ACX, "acx arp ip filter, enable: %d", enable);
+
+	acx = kzalloc(sizeof(*acx), GFP_KERNEL);
+	if (!acx) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	acx->version = ACX_IPV4_VERSION;
+	acx->enable = enable;
+
+	if (enable == true)
+		memcpy(acx->address, &address, ACX_IPV4_ADDR_SIZE);
+
+	ret = wl1251_cmd_configure(wl, ACX_ARP_IP_FILTER,
+				   acx, sizeof(*acx));
+	if (ret < 0) {
+		wl1251_warning("failed to set arp ip filter: %d", ret);
 		goto out;
 	}
 

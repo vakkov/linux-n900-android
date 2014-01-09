@@ -220,6 +220,9 @@ ifneq ($(CONFIG_DRM_OMAP),)
 obj-y					+= drm.o
 endif
 
+omap-ssi-$(CONFIG_OMAP_SSI)		:= ssi.o
+obj-y					+= $(omap-ssi-m) $(omap-ssi-y)
+
 # Specific board support
 obj-$(CONFIG_MACH_OMAP_GENERIC)		+= board-generic.o
 obj-$(CONFIG_MACH_OMAP_H4)		+= board-h4.o
@@ -235,9 +238,11 @@ obj-$(CONFIG_MACH_OMAP3_PANDORA)	+= board-omap3pandora.o
 obj-$(CONFIG_MACH_OMAP_3430SDP)		+= board-3430sdp.o
 obj-$(CONFIG_MACH_NOKIA_N8X0)		+= board-n8x0.o
 obj-$(CONFIG_MACH_NOKIA_RM680)		+= board-rm680.o sdram-nokia.o
+obj-$(CONFIG_MACH_NOKIA_RX51)		+= board-rx51-compat.o
 obj-$(CONFIG_MACH_NOKIA_RX51)		+= board-rx51.o sdram-nokia.o
 obj-$(CONFIG_MACH_NOKIA_RX51)		+= board-rx51-peripherals.o
 obj-$(CONFIG_MACH_NOKIA_RX51)		+= board-rx51-video.o
+obj-$(CONFIG_MACH_NOKIA_RX51)		+= board-rx51-camera.o
 obj-$(CONFIG_MACH_OMAP_ZOOM2)		+= board-zoom.o board-zoom-peripherals.o
 obj-$(CONFIG_MACH_OMAP_ZOOM2)		+= board-zoom-display.o
 obj-$(CONFIG_MACH_OMAP_ZOOM2)		+= board-zoom-debugboard.o

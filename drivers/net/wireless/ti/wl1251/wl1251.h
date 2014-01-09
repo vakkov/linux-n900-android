@@ -93,6 +93,7 @@ enum {
 	} while (0)
 
 #define WL1251_DEFAULT_RX_CONFIG (CFG_UNI_FILTER_EN |	\
+				  CFG_MC_FILTER_EN |	\
 				  CFG_BSSID_FILTER_EN)
 
 #define WL1251_DEFAULT_RX_FILTER (CFG_RX_PRSP_EN |  \
@@ -257,6 +258,12 @@ struct wl1251_debugfs {
 	struct dentry *excessive_retries;
 };
 
+enum wl1251_bt_coex_mode {
+	WL1251_BT_COEX_OFF,
+	WL1251_BT_COEX_ENABLE,
+	WL1251_BT_COEX_MONOAUDIO
+};
+
 struct wl1251_if_operations {
 	void (*read)(struct wl1251 *wl, int addr, void *buf, size_t len);
 	void (*write)(struct wl1251 *wl, int addr, void *buf, size_t len);
@@ -303,6 +310,8 @@ struct wl1251 {
 	u8 bss_type;
 	u8 listen_int;
 	int channel;
+	bool monitor_present;
+	bool joined;
 
 	void *target_mem_map;
 	struct acx_data_path_params_resp *data_path;
@@ -368,6 +377,9 @@ struct wl1251 {
 	/* PSM mode requested */
 	bool psm_requested;
 
+	/* retry counter for PSM entries */
+	u8 psm_entry_retry;
+
 	u16 beacon_int;
 	u8 dtim_period;
 
@@ -385,6 +397,8 @@ struct wl1251 {
 	struct wl1251_rx_descriptor *rx_descriptor;
 
 	struct ieee80211_vif *vif;
+
+	enum wl1251_bt_coex_mode bt_coex_mode;
 
 	u32 chip_id;
 	char fw_ver[21];

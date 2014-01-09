@@ -418,7 +418,14 @@ static struct clk_hw_omap dpll4_m5x2_ck_hw = {
 	.clkdm_name	= "dpll4_clkdm",
 };
 
-DEFINE_STRUCT_CLK(dpll4_m5x2_ck, dpll4_m5x2_ck_parent_names, dpll4_m5x2_ck_ops);
+static struct clk dpll4_m5x2_ck = {
+	.name		= "dpll4_m5x2_ck",
+	.hw		= &dpll4_m5x2_ck_hw.hw,
+	.parent_names	= dpll4_m5x2_ck_parent_names,
+	.num_parents	= ARRAY_SIZE(dpll4_m5x2_ck_parent_names),
+	.ops		= &dpll4_m5x2_ck_ops,
+	.flags		= CLK_SET_RATE_PARENT,
+};
 
 static struct clk dpll4_m5x2_ck_3630 = {
 	.name		= "dpll4_m5x2_ck",
@@ -3274,7 +3281,7 @@ static struct omap_clk omap36xx_clks[] = {
  */
 static struct omap_clk omap34xx_omap36xx_clks[] = {
 	CLK(NULL,	"aes1_ick",	&aes1_ick),
-	CLK("omap_rng",	"ick",		&rng_ick),
+	CLK("omap3-rom-rng",	"ick",		&rng_ick),
 	CLK(NULL,	"sha11_ick",	&sha11_ick),
 	CLK(NULL,	"des1_ick",	&des1_ick),
 	CLK(NULL,	"cam_mclk",	&cam_mclk),
