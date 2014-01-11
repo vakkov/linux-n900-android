@@ -3528,6 +3528,7 @@ restart:
 					continue;
 			}
 
+
 #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
 			if (family == AF_INET6) {
 				struct in6_addr *s6;

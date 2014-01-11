@@ -858,7 +858,7 @@ void usb_remove_config(struct usb_composite_dev *cdev,
 
 	unbind_config(cdev, config);
 }
-
+EXPORT_SYMBOL_GPL(usb_remove_config);
 /*-------------------------------------------------------------------------*/
 
 /* We support strings in multiple languages ... string descriptor zero
